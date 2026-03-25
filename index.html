@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Parking PRO V5</title>
+
+<style>
+body { margin:0; font-family:Arial; background:#111; color:white; }
+#map { height:55vh; }
+
+.controls { padding:10px; display:flex; flex-wrap:wrap; gap:10px; }
+button { flex:1; padding:10px; border:none; border-radius:8px; color:white; font-weight:bold; }
+.save{background:#00c853;} .return{background:#2962ff;} .clear{background:#d50000;}
+
+input, textarea { width:100%; padding:8px; border-radius:6px; border:none; }
+
+.nav-ui { text-align:center; padding:10px; }
+.arrow { font-size:50px; }
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+
+<div class="controls">
+<button class="save" onclick="saveLocation()">Save</button>
+<button class="return" onclick="returnToCar()">Return</button>
+<button class="clear" onclick="clearData()">Clear</button>
+
+<input id="floor" placeholder="Floor (B1, B2...)" oninput="this.value = this.value.toUpperCase()">
+<input type="text" id="notes" placeholder="Pillar (C4)" oninput="this.value = this.value.toUpperCase()">rea>
+</div>
+
+<div class="nav-ui">
+<div class="arrow" id="arrow">⬆️</div>
+<div id="direction">Waiting...</div>
+<div id="distance"></div>
+</div>
+
+<script>
+let map, userMarker, carMarker, polyline, reversePolyline;
+let path = JSON.parse(localStorage.getItem("path")) || [];
+let carLocation = JSON.parse(localStorage.getItem("carLocation"));
+let navigationPath = [];
+let watchId;
+let heading = 0;
+
+// Kalman Filter Variables
+let kalmanLat = null;
+let kalmanLng = null;
+let kalmanGain = 0.2;
+
+// Floor detection
+let currentFloor = "G";
+let lastAltitude = null;
+
+// INIT
+function initMap(){
+    map = new google.maps.Map(document.getElementById("map"), {
+        zoom:18,
+        center:{lat:0,lng:0}
+    });
+
+    polyline = new google.maps.Polyline({
+        map:map,
+        path:path,
+        strokeColor:"#00ffcc",
+        strokeWeight:4
+    });
+
+    if(carLocation){
+        carMarker = new google.maps.Marker({position:carLocation,map:map});
+    }
+
+    startTracking();
+}
+
+// COMPASS
+window.addEventListener("deviceorientation", e=>{
+    heading = e.alpha || 0;
+});
+
+// KALMAN FILTER
+function applyKalman(point){
+    if(kalmanLat === null){
+        kalmanLat = point.lat;
+        kalmanLng = point.lng;
+    } else {
+        kalmanLat = kalmanLat + kalmanGain * (point.lat - kalmanLat);
+        kalmanLng = kalmanLng + kalmanGain * (point.lng - kalmanLng);
+    }
+    return {lat:kalmanLat, lng:kalmanLng};
+}
+
+// TRACKING
+function startTracking(){
+    watchId = navigator.geolocation.watchPosition(pos=>{
+        let raw = {
+            lat:pos.coords.latitude,
+            lng:pos.coords.longitude
+        };
+
+        let current = applyKalman(raw);
+
+        // Floor detection (rough)
+        if(pos.coords.altitude !== null){
+            if(lastAltitude !== null){
+                let diff = pos.coords.altitude - lastAltitude;
+                if(diff > 2) currentFloor = "UP";
+                else if(diff < -2) currentFloor = "DOWN";
+            }
+            lastAltitude = pos.coords.altitude;
+        }
+
+        document.getElementById("floor").value = currentFloor;
+
+        if(!userMarker){
+            userMarker = new google.maps.Marker({position:current,map:map});
+        } else userMarker.setPosition(current);
+
+        map.panTo(current);
+
+        path.push(current);
+        if(path.length > 1000) path.shift();
+
+        localStorage.setItem("path", JSON.stringify(path));
+        polyline.setPath(path);
+
+    }, err=>alert(err.message), {enableHighAccuracy:true});
+}
+
+// SAVE
+function saveLocation(){
+    carLocation = path[path.length-1];
+    localStorage.setItem("carLocation", JSON.stringify(carLocation));
+    localStorage.setItem("floor", currentFloor);
+    localStorage.setItem("notes", document.getElementById("notes").value);
+
+    if(carMarker) carMarker.setMap(null);
+    carMarker = new google.maps.Marker({position:carLocation,map:map});
+
+    alert("Saved!");
+}
+
+// RETURN
+function returnToCar(){
+    navigator.geolocation.getCurrentPosition(pos=>{
+        let current = applyKalman({
+            lat:pos.coords.latitude,
+            lng:pos.coords.longitude
+        });
+
+        let nearest = getNearestPoint(current);
+        navigationPath = path.slice(0, nearest+1).reverse();
+
+        drawReversePath();
+        startNavigation();
+
+        speak("Follow the path");
+    });
+}
+
+// DRAW PATH
+function drawReversePath(){
+    if(reversePolyline) reversePolyline.setMap(null);
+
+    reversePolyline = new google.maps.Polyline({
+        map:map,
+        path:navigationPath,
+        strokeColor:"#ffcc00",
+        strokeWeight:5
+    });
+}
+
+// NAVIGATION
+function startNavigation(){
+    navigator.geolocation.clearWatch(watchId);
+
+    watchId = navigator.geolocation.watchPosition(pos=>{
+        let current = applyKalman({
+            lat:pos.coords.latitude,
+            lng:pos.coords.longitude
+        });
+
+        userMarker.setPosition(current);
+        map.panTo(current);
+
+        let i = getNearestNavPoint(current);
+
+        if(i >= navigationPath.length-1){
+            speak("Arrived");
+            showInfo();
+            return;
+        }
+
+        let next = navigationPath[i+1];
+        let dist = Math.round(getDistance(current, next));
+
+        updateDirection(current, next, dist);
+
+        if(getDistance(current, navigationPath[i]) > 20){
+            openGoogleMaps(current);
+        }
+
+    }, err=>alert(err.message), {enableHighAccuracy:true});
+}
+
+// DIRECTION WITH COMPASS
+function updateDirection(curr, next, dist){
+    let dx = next.lng - curr.lng;
+    let dy = next.lat - curr.lat;
+
+    let targetAngle = Math.atan2(dy, dx) * 180/Math.PI;
+    let diff = normalizeAngle(targetAngle - heading);
+
+    let arrow="⬆️", text="Straight";
+
+    if(diff > 30 && diff < 120){ arrow="➡️"; text="Right"; }
+    else if(diff < -30 && diff > -120){ arrow="⬅️"; text="Left"; }
+    else if(Math.abs(diff) > 150){ arrow="⬇️"; text="Back"; }
+
+    document.getElementById("arrow").innerText = arrow;
+    document.getElementById("direction").innerText = text;
+    document.getElementById("distance").innerText = dist + " m";
+
+    speak(text);
+}
+
+function normalizeAngle(a){
+    while(a>180)a-=360;
+    while(a<-180)a+=360;
+    return a;
+}
+
+// HELPERS
+function getNearestPoint(c){
+    let min=Infinity, idx=0;
+    path.forEach((p,i)=>{
+        let d=getDistance(c,p);
+        if(d<min){min=d; idx=i;}
+    });
+    return idx;
+}
+
+function getNearestNavPoint(c){
+    let min=Infinity, idx=0;
+    navigationPath.forEach((p,i)=>{
+        let d=getDistance(c,p);
+        if(d<min){min=d; idx=i;}
+    });
+    return idx;
+}
+
+// DISTANCE
+function getDistance(a,b){
+    const R=6371e3;
+    const φ1=a.lat*Math.PI/180;
+    const φ2=b.lat*Math.PI/180;
+    const Δφ=(b.lat-a.lat)*Math.PI/180;
+    const Δλ=(b.lng-a.lng)*Math.PI/180;
+
+    const x=Math.sin(Δφ/2)**2 +
+    Math.cos(φ1)*Math.cos(φ2)*Math.sin(Δλ/2)**2;
+
+    return R*(2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x)));
+}
+
+// GOOGLE MAPS
+function openGoogleMaps(current){
+    let url = `https://www.google.com/maps/dir/?api=1&origin=${current.lat},${current.lng}&destination=${carLocation.lat},${carLocation.lng}&travelmode=walking`;
+    window.location.href = url;
+}
+
+// INFO
+function showInfo(){
+    alert("Floor: "+localStorage.getItem("floor")+"\nNotes: "+localStorage.getItem("notes"));
+}
+
+// VOICE
+function speak(t){
+    let s=new SpeechSynthesisUtterance(t);
+    speechSynthesis.speak(s);
+}
+
+// CLEAR
+function clearData(){
+    localStorage.clear();
+    location.reload();
+}
+</script>
+
+<script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAkXSC5QiDG_iE1PPfExOEZfrwUNq0jxzY&callback=initMap" async defer></script>
+
+</body>
+</html>
